@@ -1,7 +1,78 @@
 import gradio as gr
+from video.model3d import Model3D
 import os
 import subprocess
 import shutil
+import tempfile
+import atexit
+import signal
+import json
+
+# Configuration
+CONFIG = {
+    "build_dir": os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "splatflow", "build"),
+    "supported_video_extensions": [".mp4", ".avi", ".mov", ".mkv", ".webm"],
+    "supported_image_extensions": [".jpg", ".jpeg", ".png", ".tif", ".tiff", ".bmp", ".gif"]
+}
+
+# Keep track of temporary directories to clean up
+temp_dirs = set()
+
+def cleanup_temp_dirs():
+    """Clean up all temporary directories."""
+    for temp_dir in temp_dirs:
+        try:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+        except Exception:
+            pass
+    temp_dirs.clear()
+
+# Register cleanup function to run on normal exit
+atexit.register(cleanup_temp_dirs)
+
+# Register cleanup function to run on SIGTERM
+signal.signal(signal.SIGTERM, lambda signum, frame: cleanup_temp_dirs())
+
+def validate_video_file(video_path):
+    """Validate if the video file exists and has a supported extension."""
+    if not os.path.exists(video_path):
+        return False, "Video file does not exist."
+    
+    ext = os.path.splitext(video_path)[1].lower()
+    if ext not in CONFIG["supported_video_extensions"]:
+        return False, f"Unsupported video format. Supported formats: {', '.join(CONFIG['supported_video_extensions'])}"
+    
+    return True, "Video file is valid."
+
+def extract_frames_from_video(video_path, output_dir, num_frames=50, min_buffer=1):
+    """
+    Extract frames from a video using sharp-frames tool.
+    Returns the path to the directory containing extracted frames.
+    """
+    try:
+        # Validate video file
+        is_valid, message = validate_video_file(video_path)
+        if not is_valid:
+            return None, message
+            
+        # Create output directory if it doesn't exist
+        os.makedirs(output_dir, exist_ok=True)
+        
+        # Run sharp-frames command
+        cmd = f"sharp-frames {video_path} {output_dir} --num-frames {num_frames} --min-buffer {min_buffer}"
+        result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+        
+        if result.returncode != 0:
+            return None, f"Error extracting frames: {result.stderr}"
+            
+        # Verify that frames were extracted
+        extracted_frames = [f for f in os.listdir(output_dir) if f.lower().endswith(tuple(CONFIG["supported_image_extensions"]))]
+        if not extracted_frames:
+            return None, "No frames were extracted from the video."
+            
+        return output_dir, f"Successfully extracted {len(extracted_frames)} frames."
+    except Exception as e:
+        return None, f"Error during frame extraction: {str(e)}"
 
 def scale_images(workspace, scaling_option):
     """
@@ -155,13 +226,23 @@ def run_gaussian_splat(workspace, iterations):
         add_log(f"Error: COLMAP output files not found in {sparse_dir}.")
         return "\n".join(log)
 
-    # Run opensplat command from the specific build directory.
-    build_dir = "/Users/shubham/Documents/GitHub/gsplat/OpenSplat/build"
+    # Verify build directory exists
+    if not os.path.exists(CONFIG["build_dir"]):
+        add_log(f"Error: Build directory not found at {CONFIG['build_dir']}")
+        return "\n".join(log)
+
+    # Verify opensplat executable exists
+    opensplat_path = os.path.join(CONFIG["build_dir"], "opensplat")
+    if not os.path.exists(opensplat_path):
+        add_log(f"Error: opensplat executable not found at {opensplat_path}")
+        return "\n".join(log)
+
+    # Run opensplat command
     opensplat_cmd = f"./opensplat {workspace} -n {iterations}"
     add_log("=== Training Gaussian Splat ===")
-    add_log(f"Running: {opensplat_cmd} in directory {build_dir}")
+    add_log(f"Running: {opensplat_cmd} in directory {CONFIG['build_dir']}")
 
-    result = subprocess.run(opensplat_cmd, shell=True, capture_output=True, text=True, cwd=build_dir)
+    result = subprocess.run(opensplat_cmd, shell=True, capture_output=True, text=True, cwd=CONFIG["build_dir"])
     if result.stdout:
         add_log("STDOUT:")
         add_log(result.stdout)
@@ -174,11 +255,11 @@ def run_gaussian_splat(workspace, iterations):
         return "\n".join(log)
 
     # Find and move the .ply file from build_dir to workspace.
-    ply_files = [f for f in os.listdir(build_dir) if f.endswith(".ply")]
+    ply_files = [f for f in os.listdir(CONFIG["build_dir"]) if f.endswith(".ply")]
     if ply_files:
         # Assume the most recently created .ply file is the one we want.
         ply_file = max(
-            [os.path.join(build_dir, f) for f in ply_files],
+            [os.path.join(CONFIG["build_dir"], f) for f in ply_files],
             key=os.path.getctime
         )
         output_ply = os.path.join(workspace, os.path.basename(ply_file))
@@ -192,54 +273,234 @@ def run_gaussian_splat(workspace, iterations):
 
     return "\n".join(log)
 
-def process_workflow(workspace, scaling_option, matching_type, iterations):
+def create_workspace_from_images(images):
     """
-    This function first scales the images (unless 'No Scaling' is selected),
-    runs COLMAP on the workspace, and then trains Gaussian Splats to produce a .ply file.
+    Creates a temporary workspace with the uploaded images.
+    Returns the path to the temporary workspace.
     """
-    logs = []
-    logs.append("=== Image Preparation ===")
-    # Run image scaling if needed.
-    scale_result = scale_images(workspace, scaling_option)
-    logs.append(scale_result)
+    # Create a temporary directory for the workspace
+    workspace = tempfile.mkdtemp()
+    temp_dirs.add(workspace)  # Add to set of directories to clean up
+    images_folder = os.path.join(workspace, "images")
+    os.makedirs(images_folder, exist_ok=True)
     
-    logs.append("\n=== Running COLMAP Reconstruction ===")
-    colmap_result = run_colmap(workspace, matching_type)
-    logs.append(colmap_result)
+    # Save uploaded images to the workspace
+    for img in images:
+        if img is not None:
+            # Get the original filename or generate one if not available
+            filename = getattr(img, 'name', None)
+            if filename is None:
+                filename = f"image_{len(os.listdir(images_folder))}.jpg"
+            else:
+                filename = os.path.basename(filename)
+            
+            # Save the image
+            img_path = os.path.join(images_folder, filename)
+            shutil.copy2(img.name, img_path)
     
-    logs.append("\n=== Running Gaussian Splat Training ===")
-    gaussian_result = run_gaussian_splat(workspace, iterations)
-    logs.append(gaussian_result)
+    return workspace
+
+def create_workspace_from_video(video_file, num_frames=50, min_buffer=1):
+    """
+    Creates a temporary workspace with frames extracted from the uploaded video.
+    Returns the path to the temporary workspace.
+    """
+    # Create a temporary directory for the workspace
+    workspace = tempfile.mkdtemp()
+    temp_dirs.add(workspace)  # Add to set of directories to clean up
+    images_folder = os.path.join(workspace, "images")
+    os.makedirs(images_folder, exist_ok=True)
     
-    return "\n".join(logs)
+    # Extract frames from video
+    frames_dir, status = extract_frames_from_video(video_file.name, images_folder, num_frames, min_buffer)
+    if frames_dir is None:
+        raise Exception(status)
+    
+    return workspace
+
+def process_workflow(input_type, input_files, scaling_option, matching_type, iterations, num_frames=50, min_buffer=1):
+    """
+    This function processes either uploaded images or a video through the entire workflow:
+    1. Creates a temporary workspace with the input
+    2. Scales the images if needed
+    3. Runs COLMAP
+    4. Trains Gaussian Splats
+    5. Returns the generated .ply file
+    """
+    if input_type == "Video" and not input_files:
+        return None, "No video was uploaded. Please upload a video first."
+    elif input_type == "Images" and (not input_files or len(input_files) == 0):
+        return None, "No images were uploaded. Please upload some images first."
+    
+    try:
+        # Create workspace from uploaded files
+        if input_type == "Video":
+            workspace = create_workspace_from_video(input_files[0], num_frames, min_buffer)
+        else:
+            workspace = create_workspace_from_images(input_files)
+        
+        # Run image scaling if needed
+        scale_result = scale_images(workspace, scaling_option)
+        if "Error" in scale_result:
+            return None, scale_result
+        
+        # Run COLMAP
+        colmap_result = run_colmap(workspace, matching_type)
+        if "Error" in colmap_result:
+            return None, colmap_result
+        
+        # Run Gaussian Splat training
+        splat_result = run_gaussian_splat(workspace, iterations)
+        if "Error" in splat_result:
+            return None, splat_result
+        
+        # Find the generated .ply file
+        ply_file = None
+        for file in os.listdir(workspace):
+            if file.endswith('.ply'):
+                ply_file = os.path.join(workspace, file)
+                break
+        
+        if ply_file is None:
+            return None, "No .ply file was generated during processing."
+        
+        # Create a copy of the .ply file in a new temporary directory that won't be cleaned up immediately
+        preview_dir = tempfile.mkdtemp()
+        temp_dirs.add(preview_dir)
+        preview_ply = os.path.join(preview_dir, os.path.basename(ply_file))
+        shutil.copy2(ply_file, preview_ply)
+        
+        return preview_ply, "Processing completed successfully!"
+        
+    except Exception as e:
+        return None, f"An error occurred: {str(e)}"
+    finally:
+        # Clean up temporary workspace
+        if 'workspace' in locals():
+            try:
+                shutil.rmtree(workspace, ignore_errors=True)
+                temp_dirs.discard(workspace)  # Remove from set if cleanup successful
+            except Exception:
+                pass  # If cleanup fails, the atexit handler will try again
 
 # Build a single-page Gradio interface.
 with gr.Blocks() as demo:
-    gr.Markdown("# COLMAP Workflow with Image Scaling and Gaussian Splat Training")
+    gr.Markdown("# Splatflow")
     gr.Markdown(
-        "Provide the workspace directory (which must contain an `images` folder). "
-        "Choose a scaling option and a COLMAP feature matching method. "
-        "If a scaling option other than 'No Scaling' is selected, the current "
-        "`images` folder will be renamed to `images_original` and resized images "
-        "will be saved in a new `images` folder. COLMAP is then run on these images. "
-        "Finally, Gaussian Splat training is performed to generate a .ply file."
+        "Upload your images or video to create a 3D Gaussian Splat model."
     )
     
-    workspace_input = gr.Textbox(label="Workspace Directory", placeholder="/path/to/workspace")
-    scaling_input = gr.Radio(choices=["No Scaling", "Half", "Quarter", "Eighth", "1600k"],
-                              label="Image Scaling Option",
-                              value="No Scaling")
-    matching_input = gr.Radio(choices=["Exhaustive", "Sequential", "Spatial"],
-                               label="COLMAP Feature Matching Type",
-                               value="Exhaustive")
-    iterations_input = gr.Slider(minimum=100, maximum=10000, step=100, value=2000,
-                                 label="Gaussian Splat Training Iterations")
+    with gr.Row():
+        with gr.Column():
+            input_type = gr.Radio(
+                choices=["Images", "Video"],
+                label="Input Type",
+                value="Images"
+            )
+            
+            image_input = gr.File(
+                label="Upload Images",
+                file_count="multiple",
+                file_types=["image"],
+                type="filepath",
+                visible=True
+            )
+            
+            video_input = gr.File(
+                label="Upload Video",
+                file_types=["video"],
+                type="filepath",
+                visible=False
+            )
+            
+            num_frames = gr.Slider(
+                minimum=10,
+                maximum=200,
+                step=10,
+                value=50,
+                label="Number of Frames to Extract",
+                visible=False
+            )
+            
+            min_buffer = gr.Slider(
+                minimum=1,
+                maximum=10,
+                step=1,
+                value=1,
+                label="Minimum Buffer Between Frames",
+                visible=False
+            )
+            
+            scaling_input = gr.Radio(
+                choices=["No Scaling", "Half", "Quarter", "Eighth", "1600k"],
+                label="Image Scaling Option",
+                value="No Scaling"
+            )
+            matching_input = gr.Radio(
+                choices=["Exhaustive", "Sequential", "Spatial"],
+                label="COLMAP Feature Matching Type",
+                value="Exhaustive"
+            )
+            iterations_input = gr.Slider(
+                minimum=100,
+                maximum=10000,
+                step=100,
+                value=2000,
+                label="Gaussian Splat Training Iterations"
+            )
+            
+            run_button = gr.Button("Create Model")
+            status_output = gr.Textbox(
+                label="Status",
+                interactive=False,
+                lines=3
+            )
+        
+        with gr.Column():
+            model_preview = Model3D(  # Use the custom Model3D component
+                label="3D Model Preview (Output Only)",
+                height=500,
+                interactive=False,
+                camera_position=(0, 0, 2)
+            )
     
-    run_button = gr.Button("Run Workflow")
-    output_log = gr.Textbox(label="Processing Log", lines=25)
+    def update_input_visibility(input_type):
+        return {
+            image_input: gr.update(visible=input_type == "Images"),
+            video_input: gr.update(visible=input_type == "Video"),
+            num_frames: gr.update(visible=input_type == "Video"),
+            min_buffer: gr.update(visible=input_type == "Video")
+        }
+    
+    input_type.change(
+        fn=update_input_visibility,
+        inputs=[input_type],
+        outputs=[image_input, video_input, num_frames, min_buffer]
+    )
+    
+    def process_input(input_type, image_files, video_file, scaling, matching, iterations, frames, buffer):
+        if input_type == "Video":
+            if not video_file:
+                return None, "Please upload a video file first."
+            return process_workflow(input_type, [video_file], scaling, matching, iterations, frames, buffer)
+        else:
+            if not image_files:
+                return None, "Please upload some images first."
+            return process_workflow(input_type, image_files, scaling, matching, iterations)
+    
+    run_button.click(
+        fn=process_input,
+        inputs=[
+            input_type,
+            image_input,
+            video_input,
+            scaling_input,
+            matching_input,
+            iterations_input,
+            num_frames,
+            min_buffer
+        ],
+        outputs=[model_preview, status_output]
+    )
 
-    run_button.click(fn=process_workflow,
-                     inputs=[workspace_input, scaling_input, matching_input, iterations_input],
-                     outputs=output_log)
-
-demo.launch()
+demo.launch(share=False)

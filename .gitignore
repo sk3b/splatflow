@@ -1,0 +1,7 @@
+.DS_Store
+.gradio
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
