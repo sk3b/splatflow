@@ -1,5 +1,5 @@
 import gradio as gr
-from video.model3d import Model3D
+from model3d import Model3D
 import os
 import subprocess
 import shutil
